@@ -57,6 +57,10 @@ from .const import (
     ADAPTIVE_MAX_INTERVAL,
     ADAPTIVE_LEARNED_INTERVAL_SAMPLES,
     OBS_STALE_RETRY_INTERVALS,
+    SPECI_LIKELY_DESCRIPTORS,
+    SPECI_LIKELY_PHENOMENA,
+    SPECI_BOOST_INTERVAL,
+    SPECI_BOOST_CALM_CYCLES,
     ICAO_REGEX,
 )
 
@@ -255,6 +259,7 @@ class MetarDataUpdateCoordinator(DataUpdateCoordinator):
         )
         self._last_observation_time = None
         self._stale_retry_count = 0
+        self._speci_calm_streak = SPECI_BOOST_CALM_CYCLES
 
     @property
     def accepted_source(self) -> str | None:
@@ -328,6 +333,52 @@ class MetarDataUpdateCoordinator(DataUpdateCoordinator):
     def _learned_interval(self) -> timedelta:
         """Scheduling interval: native cadence plus a publish-delay margin."""
         return self._learned_interval_raw() + ADAPTIVE_INTERVAL_MARGIN
+
+    def _is_speci_likely(self, data: dict) -> bool:
+        """Whether the just-fetched report shows SPECI-prone weather.
+
+        Checks the parsed weather_groups (see metar_parser.py) for a
+        descriptor or phenomenon in SPECI_LIKELY_DESCRIPTORS /
+        SPECI_LIKELY_PHENOMENA - see const.py for the criteria and
+        their limits (only what a single report can flag; changes
+        between reports, like a wind shift, aren't covered).
+        """
+        for group in data.get("weather_groups") or []:
+            if group.get("descriptor") in SPECI_LIKELY_DESCRIPTORS:
+                return True
+            phenomena = group.get("phenomena") or []
+            if any(p in SPECI_LIKELY_PHENOMENA for p in phenomena):
+                return True
+        return False
+
+    def _apply_speci_boost(self, data: dict, delay: timedelta) -> timedelta:
+        """Shorten the polling interval while conditions look SPECI-prone.
+
+        Narrows the wait to at most SPECI_BOOST_INTERVAL whenever the
+        latest report itself shows SPECI-prone weather, and keeps it
+        narrowed for SPECI_BOOST_CALM_CYCLES further reports after
+        conditions clear, so a fast-moving situation isn't missed
+        right as it settles. Otherwise leaves the adaptively-scheduled
+        delay untouched.
+        """
+        if self._is_speci_likely(data):
+            self._speci_calm_streak = 0
+        else:
+            self._speci_calm_streak += 1
+
+        if self._speci_calm_streak < SPECI_BOOST_CALM_CYCLES:
+            boosted = min(delay, SPECI_BOOST_INTERVAL)
+            if boosted < delay:
+                _LOGGER.debug(
+                    "%s: SPECI-prone weather (calm streak %d/%d), "
+                    "shortening next check to %s",
+                    self.station,
+                    self._speci_calm_streak,
+                    SPECI_BOOST_CALM_CYCLES,
+                    boosted,
+                )
+            return boosted
+        return delay
 
     def _compute_next_update_interval(self, data: dict) -> timedelta:
         """Schedule the next fetch from this station's own cadence.
@@ -405,6 +456,7 @@ class MetarDataUpdateCoordinator(DataUpdateCoordinator):
         jitter = timedelta(seconds=random.randint(*ADAPTIVE_JITTER_SECONDS))
         target = obs_time + interval + jitter
         delay = target - dt_util.utcnow()
+        delay = self._apply_speci_boost(data, delay)
         return max(ADAPTIVE_MIN_INTERVAL, min(delay, ADAPTIVE_MAX_INTERVAL))
 
     async def _async_update_data(self):
