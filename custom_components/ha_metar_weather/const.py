@@ -89,6 +89,27 @@ MAX_HISTORY_DISPLAY: Final[int] = 24  # Number of historical records to show in 
 # Error handling
 RETRY_INTERVALS: Final[tuple[int, ...]] = (2, 5, 10, 30)
 
+# Adaptive-polling constants for MetarDataUpdateCoordinator: the coordinator
+# schedules its next fetch from each station's own observed reporting
+# cadence instead of a flat DEFAULT_SCAN_INTERVAL for every station
+# worldwide (30-min European vs. 60-min US stations, etc.).
+ADAPTIVE_INTERVAL_MARGIN: Final[timedelta] = timedelta(minutes=5)
+ADAPTIVE_JITTER_SECONDS: Final[tuple[int, int]] = (30, 150)
+ADAPTIVE_MIN_INTERVAL: Final[timedelta] = timedelta(minutes=5)
+ADAPTIVE_MAX_INTERVAL: Final[timedelta] = timedelta(minutes=70)
+ADAPTIVE_LEARNED_INTERVAL_SAMPLES: Final[int] = 5
+
+# Short retries when the expected new observation hasn't appeared yet
+# (observation_time unchanged from the previous fetch) - e.g. the API
+# hasn't ingested the latest cycle yet. Kept short and few so a
+# temporarily late report doesn't turn into a tight polling loop; once
+# exhausted, the coordinator anchors to the station's next native
+# release slot instead (see MetarDataUpdateCoordinator._compute_next_update_interval).
+OBS_STALE_RETRY_INTERVALS: Final[tuple[timedelta, ...]] = (
+    timedelta(minutes=3),
+    timedelta(minutes=3),
+)
+
 # A report dated further ahead of the local clock than this is treated as
 # mis-keyed (a wrong DDHHMM group decoded into the future) and is neither
 # selected nor kept as the held observation. Minutes, not seconds: AWC

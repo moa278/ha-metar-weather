@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import logging
 import asyncio
+import random
 import re
 from asyncio import timeout as async_timeout
+from collections import deque
 from datetime import timedelta, timezone
 from typing import Any, Final
 
@@ -49,6 +51,12 @@ from .const import (
     DEFAULT_TAF_SCAN_INTERVAL,
     FUTURE_OBSERVATION_TOLERANCE,
     RETRY_INTERVALS,
+    ADAPTIVE_INTERVAL_MARGIN,
+    ADAPTIVE_JITTER_SECONDS,
+    ADAPTIVE_MIN_INTERVAL,
+    ADAPTIVE_MAX_INTERVAL,
+    ADAPTIVE_LEARNED_INTERVAL_SAMPLES,
+    OBS_STALE_RETRY_INTERVALS,
     ICAO_REGEX,
 )
 
@@ -242,6 +250,11 @@ class MetarDataUpdateCoordinator(DataUpdateCoordinator):
         self._retry_count = 0
         self._consecutive_failures = 0
         self._accepted_source: str | None = None
+        self._interval_samples: deque[timedelta] = deque(
+            maxlen=ADAPTIVE_LEARNED_INTERVAL_SAMPLES
+        )
+        self._last_observation_time = None
+        self._stale_retry_count = 0
 
     @property
     def accepted_source(self) -> str | None:
@@ -299,6 +312,101 @@ class MetarDataUpdateCoordinator(DataUpdateCoordinator):
             return held
         return fetched
 
+    def _learned_interval_raw(self) -> timedelta:
+        """Station's typical native reporting cadence, no margin.
+
+        Median of the observed deltas between successive
+        observation_time values, smoothing over a single late/early
+        outlier. Falls back to the fixed default until enough history
+        exists to trust a median.
+        """
+        if len(self._interval_samples) < 2:
+            return DEFAULT_SCAN_INTERVAL
+        samples = sorted(self._interval_samples)
+        return samples[len(samples) // 2]
+
+    def _learned_interval(self) -> timedelta:
+        """Scheduling interval: native cadence plus a publish-delay margin."""
+        return self._learned_interval_raw() + ADAPTIVE_INTERVAL_MARGIN
+
+    def _compute_next_update_interval(self, data: dict) -> timedelta:
+        """Schedule the next fetch from this station's own cadence.
+
+        Replaces the flat DEFAULT_SCAN_INTERVAL with a per-station
+        learned rhythm: after a new observation, wait until shortly
+        after the next one is expected (obs_time + learned interval +
+        jitter). If the expected observation hasn't shown up yet
+        (observation_time unchanged from the previous fetch), retry
+        after a short, bounded backoff (OBS_STALE_RETRY_INTERVALS).
+        Once those retries are exhausted, fall back to the station's
+        *next* native release slot (obs_time + one more native cadence)
+        plus the usual margin, rather than drifting from "now" -
+        keeping the schedule anchored to the station's actual grid.
+        """
+        obs_time = dt_util.parse_datetime(data.get("observation_time") or "")
+        if obs_time is None:
+            # Can't reason about cadence without an observation time -
+            # keep the fixed default rather than guessing.
+            self._stale_retry_count = 0
+            return DEFAULT_SCAN_INTERVAL
+
+        if obs_time.tzinfo is None:
+            obs_time = obs_time.replace(tzinfo=timezone.utc)
+
+        if (
+            self._last_observation_time is not None
+            and obs_time == self._last_observation_time
+        ):
+            # Same report as last time - the next one hasn't been
+            # published yet.
+            if self._stale_retry_count < len(OBS_STALE_RETRY_INTERVALS):
+                delay = OBS_STALE_RETRY_INTERVALS[self._stale_retry_count]
+                self._stale_retry_count += 1
+                _LOGGER.debug(
+                    "%s: observation unchanged, retrying in %s (attempt %d/%d)",
+                    self.station,
+                    delay,
+                    self._stale_retry_count,
+                    len(OBS_STALE_RETRY_INTERVALS),
+                )
+                return delay
+            # Short retries exhausted - the expected report is
+            # unusually late. Anchor to the station's *next* native
+            # release slot instead of drifting from "now": the
+            # release we were waiting for (obs_time + raw cadence) was
+            # missed, so try again after the one after that, plus the
+            # usual margin.
+            self._stale_retry_count = 0
+            raw_interval = self._learned_interval_raw()
+            fallback_target = obs_time + raw_interval + self._learned_interval()
+            delay = fallback_target - dt_util.utcnow()
+            _LOGGER.debug(
+                "%s: observation still unchanged after %d retries, "
+                "anchoring to next native release slot at %s",
+                self.station,
+                len(OBS_STALE_RETRY_INTERVALS),
+                fallback_target.isoformat(),
+            )
+            return max(ADAPTIVE_MIN_INTERVAL, min(delay, ADAPTIVE_MAX_INTERVAL))
+
+        # New observation - update the learned cadence and schedule the
+        # next fetch shortly after the next one is expected.
+        if self._last_observation_time is not None:
+            delta = obs_time - self._last_observation_time
+            if timedelta(minutes=1) < delta < timedelta(hours=2):
+                # Sanity bounds: ignore implausible deltas (clock jumps,
+                # a missed cycle) rather than let them skew the median.
+                self._interval_samples.append(delta)
+
+        self._last_observation_time = obs_time
+        self._stale_retry_count = 0
+
+        interval = self._learned_interval()
+        jitter = timedelta(seconds=random.randint(*ADAPTIVE_JITTER_SECONDS))
+        target = obs_time + interval + jitter
+        delay = target - dt_util.utcnow()
+        return max(ADAPTIVE_MIN_INTERVAL, min(delay, ADAPTIVE_MAX_INTERVAL))
+
     async def _async_update_data(self):
         """Fetch data from API with retry logic."""
         last_error = None
@@ -335,6 +443,7 @@ class MetarDataUpdateCoordinator(DataUpdateCoordinator):
                             self.station
                         )
 
+                    self.update_interval = self._compute_next_update_interval(data)
                     _LOGGER.debug("Updated data for %s: %s", self.station, data)
                     return data
 
