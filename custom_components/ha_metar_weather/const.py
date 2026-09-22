@@ -107,7 +107,7 @@ ADAPTIVE_MARGIN_MIN: Final[timedelta] = timedelta(minutes=1)
 ADAPTIVE_MARGIN_MAX: Final[timedelta] = timedelta(minutes=15)
 ADAPTIVE_JITTER_SECONDS: Final[tuple[int, int]] = (0, 480)  # 0-8 minutes
 ADAPTIVE_MIN_INTERVAL: Final[timedelta] = timedelta(minutes=5)
-ADAPTIVE_MAX_INTERVAL: Final[timedelta] = DEFAULT_SCAN_INTERVAL * 2
+ADAPTIVE_MAX_INTERVAL_FLOOR: Final[timedelta] = DEFAULT_SCAN_INTERVAL * 2
 ADAPTIVE_LEARNED_INTERVAL_SAMPLES: Final[int] = 5
 
 # Sanity bounds for a single observation-to-observation delta before it is

@@ -29,7 +29,7 @@ from custom_components.ha_metar_weather.const import (
     DOMAIN,
     DEFAULT_SCAN_INTERVAL,
     ADAPTIVE_MIN_INTERVAL,
-    ADAPTIVE_MAX_INTERVAL,
+    ADAPTIVE_MAX_INTERVAL_FLOOR,
     ADAPTIVE_MARGIN_MIN,
     ADAPTIVE_MARGIN_MAX,
     OBS_STALE_RETRY_INTERVALS,
@@ -251,7 +251,7 @@ async def test_retry_exhaustion_anchors_and_caps_at_default_interval(
 
 async def test_final_interval_never_exceeds_configured_bounds(hass_with_domain):
     """Regardless of path, update_interval must stay within
-    [ADAPTIVE_MIN_INTERVAL, ADAPTIVE_MAX_INTERVAL]."""
+    [ADAPTIVE_MIN_INTERVAL, effective_max_interval()]."""
     t0 = datetime(2026, 8, 23, 10, 0, tzinfo=timezone.utc)
     t1 = t0 + timedelta(minutes=30)
 
@@ -266,7 +266,45 @@ async def test_final_interval_never_exceeds_configured_bounds(hass_with_domain):
     with freeze_time(t1):
         await coordinator._async_update_data()
 
-    assert ADAPTIVE_MIN_INTERVAL <= coordinator.update_interval <= ADAPTIVE_MAX_INTERVAL
+    assert (
+        ADAPTIVE_MIN_INTERVAL
+        <= coordinator.update_interval
+        <= coordinator._effective_max_interval()
+    )
+
+
+async def test_dynamic_ceiling_grows_for_a_learned_hourly_station(hass_with_domain):
+    """A station whose sanity-filtered cadence is genuinely ~60min (KORD-
+    like) must get a ceiling above ADAPTIVE_MAX_INTERVAL_FLOOR once that
+    cadence is trusted (>=2 samples) - not be clipped to the flat floor
+    every cycle."""
+    t0 = datetime(2026, 8, 23, 10, 0, tzinfo=timezone.utc)
+    t1 = t0 + timedelta(hours=1)
+    t2 = t0 + timedelta(hours=2)
+
+    coordinator = MetarDataUpdateCoordinator(
+        hass_with_domain,
+        _StubMetarClient(
+            [
+                _report(t0, receipt_time=t0 + timedelta(minutes=3)),
+                _report(t1, receipt_time=t1 + timedelta(minutes=3)),
+                _report(t2, receipt_time=t2 + timedelta(minutes=3)),
+            ]
+        ),
+        "TEST",
+        DEFAULT_SCAN_INTERVAL,
+    )
+    with freeze_time(t0):
+        await coordinator._async_update_data()
+    with freeze_time(t1):
+        await coordinator._async_update_data()
+    with freeze_time(t2):
+        await coordinator._async_update_data()
+
+    # Two 60-min deltas trusted -> raw=60min; ceiling = max(60min,
+    # 60min+ADAPTIVE_MARGIN_MAX=75min) = 75min, well above the flat floor.
+    assert coordinator._effective_max_interval() == timedelta(minutes=75)
+    assert coordinator._effective_max_interval() > ADAPTIVE_MAX_INTERVAL_FLOOR
 
 
 # --- a failed update resets the interval -------------------------------------
@@ -510,9 +548,11 @@ async def test_polling_disabled_entry_does_not_reschedule(hass, aioclient_mock):
     from homeassistant.util import dt as dt_util
 
     # Advance well past any interval the adaptive schedule could have
-    # picked (its ceiling is ADAPTIVE_MAX_INTERVAL); if polling were still
-    # active, this would trigger at least one more coordinator refresh.
-    future = dt_util.utcnow() + ADAPTIVE_MAX_INTERVAL + timedelta(minutes=5)
+    # picked (its ceiling is ADAPTIVE_MAX_INTERVAL_FLOOR - no cadence has
+    # been learned yet for this freshly-set-up station); if polling were
+    # still active, this would trigger at least one more coordinator
+    # refresh.
+    future = dt_util.utcnow() + ADAPTIVE_MAX_INTERVAL_FLOOR + timedelta(minutes=5)
     with freeze_time(future):
         async_fire_time_changed(hass, future)
         await hass.async_block_till_done()

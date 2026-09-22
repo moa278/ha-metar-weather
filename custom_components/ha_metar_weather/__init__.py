@@ -56,7 +56,7 @@ from .const import (
     ADAPTIVE_MARGIN_MAX,
     ADAPTIVE_JITTER_SECONDS,
     ADAPTIVE_MIN_INTERVAL,
-    ADAPTIVE_MAX_INTERVAL,
+    ADAPTIVE_MAX_INTERVAL_FLOOR,
     ADAPTIVE_LEARNED_INTERVAL_SAMPLES,
     ADAPTIVE_DELTA_MIN,
     ADAPTIVE_DELTA_MAX,
@@ -361,6 +361,28 @@ class MetarDataUpdateCoordinator(DataUpdateCoordinator):
         """Scheduling interval: native cadence plus the learned publish-delay margin."""
         return self._learned_interval_raw() + self._learned_margin()
 
+    def _effective_max_interval(self) -> timedelta:
+        """Ceiling for the scheduled delay.
+
+        At least ADAPTIVE_MAX_INTERVAL_FLOOR (2x DEFAULT_SCAN_INTERVAL) -
+        the original flat safety net, which is what a station still on the
+        DEFAULT_SCAN_INTERVAL fallback (no trusted cadence yet) gets. Once
+        a cadence is actually trusted (>=2 sanity-filtered METAR-to-METAR
+        deltas), the ceiling grows to accommodate it - using
+        ADAPTIVE_MARGIN_MAX (the margin's own worst case) rather than
+        whatever margin happens to be learned right now, so the ceiling
+        doesn't tighten back up if recent margin samples happen to be
+        small.
+
+        Without this, a station whose genuine, sanity-filtered cadence
+        exceeds the flat floor (a 60-min station's ~63min learned interval
+        against a 60min floor) gets clipped below its own real rhythm
+        every cycle, forcing a needless retry on a large fraction of
+        cycles even though nothing about its schedule is actually wrong.
+        """
+        raw_interval = self._learned_interval_raw()
+        return max(ADAPTIVE_MAX_INTERVAL_FLOOR, raw_interval + ADAPTIVE_MARGIN_MAX)
+
     def _record_margin_sample(self, data: dict, obs_time: datetime) -> None:
         """Track a station's real publication lag (receiptTime - obsTime).
 
@@ -446,7 +468,7 @@ class MetarDataUpdateCoordinator(DataUpdateCoordinator):
                 fallback_target.isoformat(),
                 DEFAULT_SCAN_INTERVAL,
             )
-            return max(ADAPTIVE_MIN_INTERVAL, min(delay, ADAPTIVE_MAX_INTERVAL))
+            return max(ADAPTIVE_MIN_INTERVAL, min(delay, self._effective_max_interval()))
 
         # New observation - schedule the next fetch relative to it
         # regardless of report type. Only a METAR feeds the learned
@@ -470,7 +492,7 @@ class MetarDataUpdateCoordinator(DataUpdateCoordinator):
         jitter = timedelta(seconds=random.randint(*ADAPTIVE_JITTER_SECONDS))
         target = obs_time + interval + jitter
         delay = target - dt_util.utcnow()
-        return max(ADAPTIVE_MIN_INTERVAL, min(delay, ADAPTIVE_MAX_INTERVAL))
+        return max(ADAPTIVE_MIN_INTERVAL, min(delay, self._effective_max_interval()))
 
     async def async_seed_from_storage(self, storage) -> None:
         """Recover the learned cadence/margin from stored history at setup.
