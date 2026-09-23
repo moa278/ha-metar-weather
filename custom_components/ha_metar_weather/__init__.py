@@ -415,13 +415,30 @@ class MetarDataUpdateCoordinator(DataUpdateCoordinator):
         that in mind. Otherwise leaves the adaptively-scheduled delay
         untouched.
         """
-        if self._is_speci_likely(data):
+        speci_likely = self._is_speci_likely(data)
+        if speci_likely:
             self._speci_calm_streak = 0
         else:
             self._speci_calm_streak += 1
 
-        if self._speci_calm_streak < SPECI_BOOST_CALM_CYCLES:
-            return min(delay, SPECI_BOOST_INTERVAL)
+        boost_active = self._speci_calm_streak < SPECI_BOOST_CALM_CYCLES
+        boosted = min(delay, SPECI_BOOST_INTERVAL) if boost_active else delay
+
+        # TEMPORARY diagnostic - unconditional, remove before the PR.
+        _LOGGER.debug(
+            "%s: SPECI boost check - speci_likely=%s calm_streak=%d/%d "
+            "boost_active=%s raw_delay=%s boosted_delay=%s",
+            self.station,
+            speci_likely,
+            self._speci_calm_streak,
+            SPECI_BOOST_CALM_CYCLES,
+            boost_active,
+            delay,
+            boosted,
+        )
+
+        if boost_active:
+            return boosted
         return delay
 
     def _compute_next_update_interval(self, data: dict) -> timedelta:
