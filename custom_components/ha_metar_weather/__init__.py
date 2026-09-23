@@ -61,6 +61,10 @@ from .const import (
     ADAPTIVE_DELTA_MIN,
     ADAPTIVE_DELTA_MAX,
     OBS_STALE_RETRY_INTERVALS,
+    SPECI_LIKELY_DESCRIPTORS,
+    SPECI_LIKELY_PHENOMENA,
+    SPECI_BOOST_INTERVAL,
+    SPECI_BOOST_CALM_CYCLES,
     ICAO_REGEX,
 )
 
@@ -272,6 +276,7 @@ class MetarDataUpdateCoordinator(DataUpdateCoordinator):
         # off the station's real routine rhythm.
         self._last_metar_time: datetime | None = None
         self._stale_retry_count = 0
+        self._speci_calm_streak = SPECI_BOOST_CALM_CYCLES
 
     @property
     def accepted_source(self) -> str | None:
@@ -379,6 +384,46 @@ class MetarDataUpdateCoordinator(DataUpdateCoordinator):
             # or parsing anomaly, not a real publication delay.
             self._margin_samples.append(lag)
 
+    def _is_speci_likely(self, data: dict) -> bool:
+        """Whether the just-fetched report shows SPECI-prone weather.
+
+        Checks the parsed weather_groups (see metar_parser.py) for a
+        descriptor or phenomenon in SPECI_LIKELY_DESCRIPTORS /
+        SPECI_LIKELY_PHENOMENA - see const.py for the criteria and their
+        limits (only what a single report can flag; changes between
+        reports, like a wind shift, aren't covered). Read strictly from
+        this one fetch's data - never inferred or carried over.
+        """
+        for group in data.get("weather_groups") or []:
+            if group.get("descriptor") in SPECI_LIKELY_DESCRIPTORS:
+                return True
+            phenomena = group.get("phenomena") or []
+            if any(p in SPECI_LIKELY_PHENOMENA for p in phenomena):
+                return True
+        return False
+
+    def _apply_speci_boost(self, data: dict, delay: timedelta) -> timedelta:
+        """Shorten the polling interval while conditions look SPECI-prone.
+
+        Narrows the wait to at most SPECI_BOOST_INTERVAL whenever the
+        latest report itself shows SPECI-prone weather, and keeps it
+        narrowed for SPECI_BOOST_CALM_CYCLES further reports after
+        conditions clear, so a fast-moving situation isn't missed right
+        as it settles. A sustained convective airmass (TS/VCTS for hours)
+        therefore means a sustained boosted rate for that whole period,
+        not a brief spike - the 15-minute floor (const.py) is chosen with
+        that in mind. Otherwise leaves the adaptively-scheduled delay
+        untouched.
+        """
+        if self._is_speci_likely(data):
+            self._speci_calm_streak = 0
+        else:
+            self._speci_calm_streak += 1
+
+        if self._speci_calm_streak < SPECI_BOOST_CALM_CYCLES:
+            return min(delay, SPECI_BOOST_INTERVAL)
+        return delay
+
     def _compute_next_update_interval(self, data: dict) -> timedelta:
         """Schedule the next fetch from this station's own cadence.
 
@@ -470,6 +515,7 @@ class MetarDataUpdateCoordinator(DataUpdateCoordinator):
         jitter = timedelta(seconds=random.randint(*ADAPTIVE_JITTER_SECONDS))
         target = obs_time + interval + jitter
         delay = target - dt_util.utcnow()
+        delay = self._apply_speci_boost(data, delay)
         return max(ADAPTIVE_MIN_INTERVAL, min(delay, ADAPTIVE_MAX_INTERVAL))
 
     async def async_seed_from_storage(self, storage) -> None:

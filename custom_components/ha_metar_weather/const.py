@@ -130,6 +130,44 @@ OBS_STALE_RETRY_INTERVALS: Final[tuple[timedelta, ...]] = (
     timedelta(minutes=3),
 )
 
+# SPECI-boost: a routine adaptive schedule tuned to a station's normal
+# cadence has no way to predict an unscheduled SPECI - those are issued
+# when conditions change enough to matter, not on a timer. Rather than
+# polling fast at all times, the interval is narrowed only while the most
+# recently observed report itself already shows SPECI-prone weather.
+# Roughly follows the WMO/ICAO SPECI criteria (thunderstorm onset, hail,
+# funnel cloud/tornado, duststorm/sandstorm, squalls, freezing
+# precipitation) - not every SPECI trigger is representable from a single
+# parsed report alone (e.g. a wind shift or a ceiling/visibility drop needs
+# the *change* between reports), so this covers what one report can flag
+# with reasonable confidence. Slugs match WEATHER_DESCRIPTOR_CODES /
+# WEATHER_PHENOMENON_CODES below. The trigger is read strictly from the
+# just-fetched report only - never inferred or carried over from an older
+# one.
+SPECI_LIKELY_DESCRIPTORS: Final[frozenset[str]] = frozenset({
+    "thunderstorm",  # TS
+    "freezing",       # FZ (freezing precipitation)
+})
+SPECI_LIKELY_PHENOMENA: Final[frozenset[str]] = frozenset({
+    "hail",           # GR
+    "small_hail",     # GS
+    "funnel_cloud",   # FC (tornado/funnel cloud)
+    "duststorm",      # DS
+    "sandstorm",      # SS
+    "squalls",        # SQ
+    "volcanic_ash",   # VA
+})
+# 15-minute floor per review: a sustained convective airmass (TS/VCTS for
+# hours) makes this a sustained ~2x rate for that whole period, not a
+# brief spike - keep it conservative rather than matching the base
+# station's own short-retry cadence.
+SPECI_BOOST_INTERVAL: Final[timedelta] = timedelta(minutes=15)
+# The boosted interval stays active for this many consecutive
+# SPECI-free reports after the last SPECI-likely one, so a fast-moving
+# situation isn't missed right as it clears (avoids flapping between
+# the short and normal interval at the edge of a thunderstorm).
+SPECI_BOOST_CALM_CYCLES: Final[int] = 2
+
 # A report dated further ahead of the local clock than this is treated as
 # mis-keyed (a wrong DDHHMM group decoded into the future) and is neither
 # selected nor kept as the held observation. Minutes, not seconds: AWC
