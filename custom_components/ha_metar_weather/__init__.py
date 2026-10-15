@@ -612,6 +612,15 @@ class MetarDataUpdateCoordinator(DataUpdateCoordinator):
                         )
 
                     self.update_interval = self._compute_next_update_interval(data)
+                    _LOGGER.debug(
+                        "%s: next fetch in %s (obs=%s type=%s, learned raw=%s margin=%s)",
+                        self.station,
+                        self.update_interval,
+                        data.get("observation_time"),
+                        data.get("metar_type"),
+                        self._learned_interval_raw(),
+                        self._learned_margin(),
+                    )
                     _LOGGER.debug("Updated data for %s: %s", self.station, data)
                     return data
 
