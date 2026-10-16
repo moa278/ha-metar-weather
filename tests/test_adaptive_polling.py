@@ -688,3 +688,118 @@ async def test_polling_disabled_also_disables_taf_polling(hass, aioclient_mock):
     assert taf_coordinator.config_entry is entry
 
     await _teardown(hass, entry)
+
+
+# --- SPECI boost: SPECI-prone current weather shortens the wait -------------
+
+
+def _ts_report(obs_time: datetime, *, raw: str = "VCTS", **kwargs) -> dict:
+    """A report whose current conditions show a thunderstorm group."""
+    report = _report(obs_time, **kwargs)
+    report["weather_groups"] = [
+        {
+            "intensity": "vicinity" if raw.startswith("VC") else None,
+            "descriptor": "thunderstorm",
+            "phenomena": [],
+            "recent": False,
+            "raw": raw,
+        }
+    ]
+    return report
+
+
+async def test_boost_triggers_on_vicinity_thunderstorm(hass_with_domain):
+    obs = datetime(2026, 8, 23, 10, 53, tzinfo=timezone.utc)
+    coordinator = _seeded_coordinator(hass_with_domain, obs - timedelta(hours=1))
+
+    with freeze_time(obs + timedelta(minutes=5)):
+        delay = coordinator._compute_next_update_interval(_ts_report(obs, raw="VCTS"))
+
+    assert delay <= timedelta(minutes=15)
+
+
+async def test_boost_ignores_trend_only_thunderstorm(hass_with_domain):
+    """A TEMPO TSRA lives in the trend text, not in the current weather
+    groups: it must not shorten the wait."""
+    obs = datetime(2026, 8, 23, 10, 53, tzinfo=timezone.utc)
+    coordinator = _seeded_coordinator(hass_with_domain, obs - timedelta(hours=1))
+    report = _report(obs)
+    report["weather_groups"] = []
+    report["trend"] = "TEMPO TSRA"
+
+    with freeze_time(obs + timedelta(minutes=5)):
+        delay = coordinator._compute_next_update_interval(report)
+
+    assert delay > timedelta(minutes=15)
+
+
+async def test_boost_ignores_recent_weather_group(hass_with_domain):
+    """RETS (recent thunderstorm) is not current weather."""
+    obs = datetime(2026, 8, 23, 10, 53, tzinfo=timezone.utc)
+    coordinator = _seeded_coordinator(hass_with_domain, obs - timedelta(hours=1))
+    report = _ts_report(obs)
+    report["weather_groups"][0]["recent"] = True
+
+    with freeze_time(obs + timedelta(minutes=5)):
+        delay = coordinator._compute_next_update_interval(report)
+
+    assert delay > timedelta(minutes=15)
+
+
+async def test_boost_afterglow_is_one_learned_cadence(hass_with_domain):
+    """After the last thunderstorm report the boost lasts one learned
+    cadence (60 min here), then the normal schedule takes over again."""
+    t_ts = datetime(2026, 8, 23, 10, 53, tzinfo=timezone.utc)
+    coordinator = _seeded_coordinator(hass_with_domain, t_ts - timedelta(hours=1))
+
+    with freeze_time(t_ts + timedelta(minutes=4)):
+        coordinator._compute_next_update_interval(_ts_report(t_ts))
+
+    t_calm = t_ts + timedelta(minutes=30)
+    calm = _report(t_calm)
+    calm["weather_groups"] = []
+    with freeze_time(t_calm + timedelta(minutes=4)):  # 34 min after TS: still inside
+        inside = coordinator._compute_next_update_interval(calm)
+    assert inside <= timedelta(minutes=15)
+
+    t_late = t_ts + timedelta(minutes=61)
+    late = _report(t_late)
+    late["weather_groups"] = []
+    with freeze_time(t_late + timedelta(minutes=4)):  # 65 min after TS: expired
+        outside = coordinator._compute_next_update_interval(late)
+    assert outside > timedelta(minutes=15)
+
+
+async def test_boost_afterglow_defaults_to_30_minutes_without_cadence(
+    hass_with_domain,
+):
+    coordinator = MetarDataUpdateCoordinator(
+        hass_with_domain, _StubMetarClient([]), "TEST", DEFAULT_SCAN_INTERVAL
+    )
+    assert coordinator._speci_afterglow() == timedelta(minutes=30)
+
+
+async def test_boost_not_kept_alive_by_old_held_report(hass_with_domain):
+    """A silent station keeps handing back an old thunderstorm report; that
+    must not hold the boost forever."""
+    obs = datetime(2026, 8, 23, 10, 53, tzinfo=timezone.utc)
+    coordinator = _seeded_coordinator(hass_with_domain, obs)
+
+    with freeze_time(obs + timedelta(hours=3)):
+        delay = coordinator._compute_next_update_interval(_ts_report(obs))
+
+    assert delay > timedelta(minutes=15)
+    assert coordinator._speci_boost_until is None
+
+
+async def test_boost_caps_wait_for_unchanged_report_before_slot(hass_with_domain):
+    """An unchanged report before its slot normally waits for the slot -
+    under the boost it is rechecked within 15 minutes (a SPECI is off-slot)."""
+    obs = datetime(2026, 8, 23, 10, 53, tzinfo=timezone.utc)
+    coordinator = _seeded_coordinator(hass_with_domain, obs)
+
+    with freeze_time(obs + timedelta(minutes=10)):
+        delay = coordinator._compute_next_update_interval(_ts_report(obs))
+
+    assert delay <= timedelta(minutes=15)
+    assert coordinator._stale_retry_count == 0  # no retry chain started

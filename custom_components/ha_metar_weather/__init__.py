@@ -61,6 +61,11 @@ from .const import (
     ADAPTIVE_DELTA_MIN,
     ADAPTIVE_DELTA_MAX,
     OBS_STALE_RETRY_INTERVALS,
+    SPECI_LIKELY_DESCRIPTORS,
+    SPECI_LIKELY_PHENOMENA,
+    SPECI_BOOST_INTERVAL,
+    SPECI_BOOST_AFTERGLOW_MIN,
+    SPECI_BOOST_AFTERGLOW_MAX,
     ICAO_REGEX,
 )
 
@@ -272,6 +277,7 @@ class MetarDataUpdateCoordinator(DataUpdateCoordinator):
         # off the station's real routine rhythm.
         self._last_metar_time: datetime | None = None
         self._stale_retry_count = 0
+        self._speci_boost_until: datetime | None = None
 
     @property
     def accepted_source(self) -> str | None:
@@ -379,7 +385,74 @@ class MetarDataUpdateCoordinator(DataUpdateCoordinator):
             # or parsing anomaly, not a real publication delay.
             self._margin_samples.append(lag)
 
+    def _is_speci_likely(self, data: dict) -> bool:
+        """Whether the current conditions of this report show SPECI-prone weather.
+
+        Reads weather_groups (current-conditions part only, see
+        metar_parser.py) for a descriptor/phenomenon listed in
+        SPECI_LIKELY_DESCRIPTORS / SPECI_LIKELY_PHENOMENA. VCTS counts; a
+        trend (TEMPO/BECMG) never does.
+        """
+        for group in data.get("weather_groups") or []:
+            if group.get("recent"):
+                continue
+            if group.get("descriptor") in SPECI_LIKELY_DESCRIPTORS:
+                return True
+            if any(p in SPECI_LIKELY_PHENOMENA for p in group.get("phenomena") or []):
+                return True
+        return False
+
+    def _speci_afterglow(self) -> timedelta:
+        """How long the boost outlasts the last SPECI-prone report: one learned cadence."""
+        return max(
+            SPECI_BOOST_AFTERGLOW_MIN,
+            min(self._learned_interval_raw(), SPECI_BOOST_AFTERGLOW_MAX),
+        )
+
+    def _apply_speci_boost(self, data: dict, delay: timedelta) -> timedelta:
+        """Narrow the wait to SPECI_BOOST_INTERVAL while SPECI-prone weather is current.
+
+        Active while the latest report shows SPECI-prone weather and for
+        one learned cadence after the last such report; a report older than
+        ADAPTIVE_DELTA_MAX (a silent station holding old data) never keeps
+        it alive. Otherwise the scheduled delay is returned untouched.
+        """
+        obs_time = dt_util.parse_datetime(data.get("observation_time") or "")
+        if obs_time is None:
+            return delay
+        if obs_time.tzinfo is None:
+            obs_time = obs_time.replace(tzinfo=timezone.utc)
+        now = dt_util.utcnow()
+
+        speci_likely = self._is_speci_likely(data)
+        if speci_likely and now - obs_time <= ADAPTIVE_DELTA_MAX:
+            until = obs_time + self._speci_afterglow()
+            if self._speci_boost_until is None or until > self._speci_boost_until:
+                self._speci_boost_until = until
+
+        boost_active = (
+            self._speci_boost_until is not None and now < self._speci_boost_until
+        )
+        boosted = min(delay, SPECI_BOOST_INTERVAL) if boost_active else delay
+
+        # TEMPORARY diagnostic for the live test - remove before any PR.
+        _LOGGER.debug(
+            "%s: SPECI boost check - speci_likely=%s boost_until=%s "
+            "boost_active=%s scheduled=%s result=%s",
+            self.station,
+            speci_likely,
+            self._speci_boost_until.isoformat() if self._speci_boost_until else None,
+            boost_active,
+            delay,
+            boosted,
+        )
+        return boosted
+
     def _compute_next_update_interval(self, data: dict) -> timedelta:
+        """Scheduled interval with the SPECI boost applied on top."""
+        return self._apply_speci_boost(data, self._compute_scheduled_interval(data))
+
+    def _compute_scheduled_interval(self, data: dict) -> timedelta:
         """Schedule the next fetch from this station's own cadence.
 
         Replaces the flat DEFAULT_SCAN_INTERVAL with a per-station learned

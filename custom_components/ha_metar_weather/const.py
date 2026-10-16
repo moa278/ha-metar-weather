@@ -130,6 +130,40 @@ OBS_STALE_RETRY_INTERVALS: Final[tuple[timedelta, ...]] = (
     timedelta(minutes=3),
 )
 
+# SPECI-boost: a routine adaptive schedule tuned to a station's normal
+# cadence cannot predict an unscheduled SPECI - those are issued when
+# conditions change enough to matter, not on a timer. So the interval is
+# narrowed while the *current-conditions* part of the latest report shows
+# SPECI-prone weather (roughly the WMO/ICAO SPECI criteria that one report
+# can show: thunderstorm onset, hail, funnel cloud/tornado, duststorm/
+# sandstorm, squalls, freezing precipitation, volcanic ash). A thunderstorm
+# in the vicinity (VCTS) counts on purpose: whether it sits on the field or
+# a few km away matters for flight weather alike. Only the current part is
+# read - a TEMPO/BECMG trend group never triggers the boost. Slugs match
+# WEATHER_DESCRIPTOR_CODES / WEATHER_PHENOMENON_CODES below.
+SPECI_LIKELY_DESCRIPTORS: Final[frozenset[str]] = frozenset({
+    "thunderstorm",  # TS, VCTS
+    "freezing",       # FZ (freezing precipitation)
+})
+SPECI_LIKELY_PHENOMENA: Final[frozenset[str]] = frozenset({
+    "hail",           # GR
+    "small_hail",     # GS
+    "funnel_cloud",   # FC (tornado/funnel cloud)
+    "duststorm",      # DS
+    "sandstorm",      # SS
+    "squalls",        # SQ
+    "volcanic_ash",   # VA
+})
+# Upper bound for the wait while the boost is active.
+SPECI_BOOST_INTERVAL: Final[timedelta] = timedelta(minutes=15)
+# After the last report that showed SPECI-prone weather the boost keeps
+# running for one learned reporting cadence (clamped to this range; a
+# station without a learned cadence gets the lower bound), so the next
+# routine report is still seen at the short interval, without keeping
+# the boost on for hours once the weather has cleared.
+SPECI_BOOST_AFTERGLOW_MIN: Final[timedelta] = timedelta(minutes=30)
+SPECI_BOOST_AFTERGLOW_MAX: Final[timedelta] = timedelta(minutes=60)
+
 # A report dated further ahead of the local clock than this is treated as
 # mis-keyed (a wrong DDHHMM group decoded into the future) and is neither
 # selected nor kept as the held observation. Minutes, not seconds: AWC
