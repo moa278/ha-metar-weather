@@ -111,6 +111,23 @@ class MetarParser:
             self._body_parts_cache = body
         return self._body_parts_cache
 
+    @staticmethod
+    def _without_header(parts: List[str]) -> List[str]:
+        """Return the body tokens after the DDHHMMZ time group.
+
+        Falls back to skipping a leading METAR/SPECI and the 4-character
+        station identifier when no time group is present.
+        """
+        for idx, token in enumerate(parts[:5]):
+            if re.fullmatch(r"\d{6}Z", token):
+                return parts[idx + 1:]
+        idx = 0
+        if parts and parts[0] in ("METAR", "SPECI"):
+            idx = 1
+        if idx < len(parts) and re.fullmatch(r"[A-Z][A-Z0-9]{3}", parts[idx]):
+            idx += 1
+        return parts[idx:]
+
     def parse_cloud_layers(self) -> List[CloudLayer]:
         """Parse cloud information from METAR.
 
@@ -253,7 +270,12 @@ class MetarParser:
             if "CAVOK" in parts:
                 return []
 
-            for original_part in parts:
+            # Drop the report header (type, ICAO, time group): a station
+            # identifier such as VABB (VA), FCBB (FC) or FZAA (FZ) would
+            # otherwise parse as a weather group.
+            weather_parts = self._without_header(parts)
+
+            for original_part in weather_parts:
                 # Skip non-weather tokens. Runway groups (R24L/550362) are caught
                 # by the '/' check; do NOT skip a leading 'R' (RA = rain).
                 if (original_part.endswith('KT') or original_part.endswith('MPS') or

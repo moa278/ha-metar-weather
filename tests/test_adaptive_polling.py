@@ -767,3 +767,137 @@ async def test_polling_disabled_also_disables_taf_polling(hass, aioclient_mock):
 
     await _teardown(hass, entry)
 
+
+
+# --- SPECI boost: SPECI-prone current weather shortens the wait -------------
+
+
+def _ts_report(obs_time: datetime, **kwargs) -> dict:
+    """A report whose current conditions show a thunderstorm group."""
+    report = _report(obs_time, **kwargs)
+    report["weather_groups"] = [
+        {
+            "intensity": "vicinity",
+            "descriptor": "thunderstorm",
+            "phenomena": [],
+            "recent": False,
+            "raw": "VCTS",
+        }
+    ]
+    return report
+
+
+def _half_hourly_history():
+    return _history(T0 - 60 * MIN, T0 - 30 * MIN, T0)
+
+
+def test_boost_caps_the_scheduled_wait_at_15_minutes(hass_with_domain):
+    """Without weather this fetch waits 29 minutes (see the grid test);
+    a vicinity thunderstorm caps it at exactly 15."""
+    c = _coordinator(hass_with_domain)
+    report = _ts_report(T0, receipt_time=T0 + 4 * MIN)
+    assert _next(c, report, T0 + 7 * MIN, _half_hourly_history()) == 15 * MIN
+    assert c._speci_boost_until == T0 + 30 * MIN
+
+
+def test_boost_ignores_trend_only_thunderstorm(hass_with_domain):
+    c = _coordinator(hass_with_domain)
+    report = _report(T0, receipt_time=T0 + 4 * MIN)
+    report["weather_groups"] = []
+    report["trend"] = "TEMPO TSRA"
+    assert _next(c, report, T0 + 7 * MIN, _half_hourly_history()) == 29 * MIN
+
+
+def test_boost_ignores_recent_weather_group(hass_with_domain):
+    c = _coordinator(hass_with_domain)
+    report = _ts_report(T0, receipt_time=T0 + 4 * MIN)
+    report["weather_groups"][0]["recent"] = True
+    assert _next(c, report, T0 + 7 * MIN, _half_hourly_history()) == 29 * MIN
+
+
+def test_boost_afterglow_is_one_learned_cadence(hass_with_domain):
+    """Hourly station (cadence 60): the boost outlasts the thunderstorm
+    report by 60 minutes, then the normal schedule takes over."""
+    c = _coordinator(hass_with_domain)
+    history = _history(T0 - 120 * MIN, T0 - 60 * MIN, T0)
+    assert _next(c, _ts_report(T0, receipt_time=T0 + 4 * MIN), T0 + 7 * MIN, history) <= 15 * MIN
+    assert c._speci_boost_until == T0 + 60 * MIN
+
+    calm_speci = _report(T0 + 30 * MIN, metar_type="SPECI")
+    inside = _next(c, calm_speci, T0 + 34 * MIN, history)
+    assert inside <= 15 * MIN  # 34 min after the storm report: still boosted
+
+    calm = _report(T0 + 61 * MIN, receipt_time=T0 + 65 * MIN)
+    outside = _next(c, calm, T0 + 66 * MIN, history)
+    assert outside > 15 * MIN  # 66 min after: expired
+
+
+def test_boost_afterglow_defaults_to_30_minutes_without_cadence(hass_with_domain):
+    assert _coordinator(hass_with_domain)._speci_afterglow() == 30 * MIN
+
+
+def test_boost_not_kept_alive_by_old_held_report(hass_with_domain):
+    """A silent station keeps handing back an old thunderstorm report."""
+    c = _coordinator(hass_with_domain)
+    now = T0 + 3 * 60 * MIN
+    delay = _next(c, _ts_report(T0), now, _half_hourly_history())
+    calm = _next(
+        _coordinator(hass_with_domain), _report(T0), now, _half_hourly_history()
+    )
+    assert delay == calm  # the schedule is untouched by the old storm report
+    assert c._speci_boost_until is None
+
+
+def test_boost_caps_unchanged_report_before_slot_without_retry_chain(
+    hass_with_domain,
+):
+    c = _coordinator(hass_with_domain)
+    c._last_observation_time = T0
+    report = _ts_report(T0, receipt_time=T0 + 4 * MIN)
+    delay = _next(c, report, T0 + 10 * MIN, _half_hourly_history())
+    assert delay == 15 * MIN
+    assert c._stale_retry_count == 0
+
+
+def test_station_id_with_weather_code_does_not_boost(hass_with_domain):
+    """VABB starts with VA (volcanic ash): the parsed report of a calm
+    METAR must not start the boost."""
+    from custom_components.ha_metar_weather.metar_parser import MetarParser
+
+    c = _coordinator(hass_with_domain)
+    raw = "METAR VABB 100000Z 32007KT 2200 HZ NSC 33/22 Q1011 NOSIG"
+    data = _report(T0, receipt_time=T0 + 4 * MIN)
+    data["weather_groups"] = MetarParser(raw).get_parsed_data()["weather_groups"]
+    assert [g["raw"] for g in data["weather_groups"]] == ["HZ"]
+    assert not c._is_speci_likely(data)
+    assert _next(c, data, T0 + 7 * MIN, _half_hourly_history()) == 29 * MIN
+
+
+def test_boost_afterglow_is_clamped_to_30_and_60_minutes(hass_with_domain):
+    fast = _coordinator(hass_with_domain)
+    fast._learned_cadence = lambda: 10 * MIN
+    assert fast._speci_afterglow() == 30 * MIN  # lower bound
+    slow = _coordinator(hass_with_domain)
+    slow._learned_cadence = lambda: 180 * MIN
+    assert slow._speci_afterglow() == 60 * MIN  # upper bound
+
+
+def test_boost_deadline_only_moves_forward(hass_with_domain):
+    """A later storm report extends the boost; an earlier one never
+    shortens it."""
+    c = _coordinator(hass_with_domain)
+    history = _half_hourly_history()
+    _next(c, _ts_report(T0, receipt_time=T0 + 4 * MIN), T0 + 7 * MIN, history)
+    assert c._speci_boost_until == T0 + 30 * MIN
+    later = T0 + 20 * MIN
+    _next(c, _ts_report(later, metar_type="SPECI"), later + 3 * MIN, history)
+    assert c._speci_boost_until == later + 30 * MIN
+    _next(c, _ts_report(T0, receipt_time=T0 + 4 * MIN), later + 5 * MIN, history)
+    assert c._speci_boost_until == later + 30 * MIN  # not pulled back
+
+
+def test_trend_group_after_tempo_is_not_current_weather():
+    from custom_components.ha_metar_weather.metar_parser import MetarParser
+
+    raw = "METAR KMIA 201300Z 32007KT 9999 FEW040 33/22 Q1011 TEMPO TSRA"
+    assert MetarParser(raw).get_parsed_data()["weather_groups"] == []

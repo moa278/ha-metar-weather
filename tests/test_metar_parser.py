@@ -188,3 +188,24 @@ def test_wind_mps_exact_kmh():
     """8 m/s = 28.8 km/h exactly; must not be quantized through knots."""
     data = parse("UUEE 121630Z 24008MPS 9999 BKN040 18/12 Q1009 NOSIG")
     assert data["wind_speed"] == pytest.approx(28.8)
+
+
+@pytest.mark.parametrize("icao", [
+    "VABB", "VAAH", "FCBB", "FZAA", "SAEZ", "TSXX", "GRXX", "SQXX", "DSXX", "BRXX",
+])
+@pytest.mark.parametrize("prefix", ["METAR ", "SPECI ", ""])
+def test_station_id_is_not_a_weather_group(icao, prefix):
+    data = parse(f"{prefix}{icao} 201300Z 32007KT 9999 NSC 33/22 Q1011 NOSIG")
+    assert data["weather_groups"] == []
+
+
+@pytest.mark.parametrize("icao", ["VABB", "FCBB", "FZAA"])
+def test_real_weather_still_parsed_with_weather_like_station(icao):
+    data = parse(f"METAR {icao} 201300Z 32007KT 2200 FU TSRA BKN040 33/22 Q1011")
+    raws = [g["raw"] for g in data["weather_groups"]]
+    assert raws == ["FU", "TSRA"]
+
+
+def test_station_without_time_group_fallback():
+    data = parse("METAR VABB 32007KT 2200 HZ Q1011")
+    assert [g["raw"] for g in data["weather_groups"]] == ["HZ"]
