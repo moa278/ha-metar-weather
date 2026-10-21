@@ -64,8 +64,7 @@ from .const import (
     SPECI_LIKELY_DESCRIPTORS,
     SPECI_LIKELY_PHENOMENA,
     SPECI_BOOST_INTERVAL,
-    SPECI_BOOST_AFTERGLOW_MIN,
-    SPECI_BOOST_AFTERGLOW_MAX,
+    SPECI_BOOST_AFTERGLOW,
     OBS_STALE_RETRY_INTERVALS,
     ICAO_REGEX,
 )
@@ -279,6 +278,7 @@ class MetarDataUpdateCoordinator(DataUpdateCoordinator):
         # report is published within the margin again.
         self._exhausted_cycles = 0
         self._speci_boost_until: datetime | None = None
+        self._speci_trigger_obs: datetime | None = None
         self._exhaust_pending = False
         self._chronic_lag = False
         # Stable per-install offset on the station's grid (see const.py).
@@ -432,20 +432,16 @@ class MetarDataUpdateCoordinator(DataUpdateCoordinator):
                 return True
         return False
 
-    def _speci_afterglow(self) -> timedelta:
-        """How long the boost outlasts the last SPECI-prone report: one learned cadence."""
-        return max(
-            SPECI_BOOST_AFTERGLOW_MIN,
-            min(self._learned_cadence(), SPECI_BOOST_AFTERGLOW_MAX),
-        )
-
     def _apply_speci_boost(self, data: dict, delay: timedelta) -> timedelta:
         """Narrow the wait to SPECI_BOOST_INTERVAL while SPECI-prone weather is current.
 
-        Active while the latest report shows SPECI-prone weather and for
-        one learned cadence after the last such report; a report older than
-        ADAPTIVE_DELTA_MAX (a silent station holding old data) never keeps
-        it alive. Otherwise the scheduled delay is returned untouched.
+        A new report (newer observation than the last trigger) that shows
+        SPECI-prone weather starts or extends the boost to SPECI_BOOST_AFTERGLOW
+        after the moment it was seen - not after its observation time, so a
+        report seen late does not shorten the boost. The same held report
+        never extends it again, and a report older than ADAPTIVE_DELTA_MAX
+        (a silent station holding old data) never starts it. Otherwise the
+        scheduled delay is returned untouched.
         """
         obs_time = dt_util.parse_datetime(data.get("observation_time") or "")
         if obs_time is None:
@@ -455,10 +451,14 @@ class MetarDataUpdateCoordinator(DataUpdateCoordinator):
         now = dt_util.utcnow()
 
         speci_likely = self._is_speci_likely(data)
-        if speci_likely and now - obs_time <= ADAPTIVE_DELTA_MAX:
-            until = obs_time + self._speci_afterglow()
-            if self._speci_boost_until is None or until > self._speci_boost_until:
-                self._speci_boost_until = until
+        if (
+            speci_likely
+            and now - obs_time <= ADAPTIVE_DELTA_MAX
+            and (self._speci_trigger_obs is None or obs_time > self._speci_trigger_obs)
+        ):
+            self._speci_trigger_obs = obs_time
+            # now only moves forward, so this never shortens a running boost.
+            self._speci_boost_until = now + SPECI_BOOST_AFTERGLOW
 
         boost_active = (
             self._speci_boost_until is not None and now < self._speci_boost_until

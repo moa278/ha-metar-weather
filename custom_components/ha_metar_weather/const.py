@@ -156,13 +156,12 @@ SPECI_LIKELY_PHENOMENA: Final[frozenset[str]] = frozenset({
 })
 # Upper bound for the wait while the boost is active.
 SPECI_BOOST_INTERVAL: Final[timedelta] = timedelta(minutes=15)
-# After the last report that showed SPECI-prone weather the boost keeps
-# running for one learned reporting cadence (clamped to this range; a
-# station without a learned cadence gets the lower bound), so the next
-# routine report is still seen at the short interval, without keeping
-# the boost on for hours once the weather has cleared.
-SPECI_BOOST_AFTERGLOW_MIN: Final[timedelta] = timedelta(minutes=30)
-SPECI_BOOST_AFTERGLOW_MAX: Final[timedelta] = timedelta(minutes=60)
+# The boost keeps running for this long after the moment a new report with
+# SPECI-prone weather was seen (not after its observation time), so the
+# next routine report and a storm that flares up again are still seen at the
+# short interval, without keeping the boost on for hours once the weather
+# has cleared.
+SPECI_BOOST_AFTERGLOW: Final[timedelta] = timedelta(minutes=60)
 
 # Short retries when the expected new observation hasn't appeared yet
 # (observation_time unchanged from the previous fetch) - e.g. the API

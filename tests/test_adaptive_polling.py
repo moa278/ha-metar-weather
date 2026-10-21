@@ -797,7 +797,7 @@ def test_boost_caps_the_scheduled_wait_at_15_minutes(hass_with_domain):
     c = _coordinator(hass_with_domain)
     report = _ts_report(T0, receipt_time=T0 + 4 * MIN)
     assert _next(c, report, T0 + 7 * MIN, _half_hourly_history()) == 15 * MIN
-    assert c._speci_boost_until == T0 + 30 * MIN
+    assert c._speci_boost_until == T0 + 67 * MIN  # seen at +7 min, plus 60
 
 
 def test_boost_ignores_trend_only_thunderstorm(hass_with_domain):
@@ -815,25 +815,30 @@ def test_boost_ignores_recent_weather_group(hass_with_domain):
     assert _next(c, report, T0 + 7 * MIN, _half_hourly_history()) == 29 * MIN
 
 
-def test_boost_afterglow_is_one_learned_cadence(hass_with_domain):
-    """Hourly station (cadence 60): the boost outlasts the thunderstorm
-    report by 60 minutes, then the normal schedule takes over."""
+def test_boost_runs_60_minutes_after_the_report_was_seen(hass_with_domain):
+    """Hourly station: storm report seen at +7 min keeps the boost to +67;
+    after that the normal schedule takes over again."""
     c = _coordinator(hass_with_domain)
     history = _history(T0 - 120 * MIN, T0 - 60 * MIN, T0)
     assert _next(c, _ts_report(T0, receipt_time=T0 + 4 * MIN), T0 + 7 * MIN, history) <= 15 * MIN
-    assert c._speci_boost_until == T0 + 60 * MIN
 
     calm_speci = _report(T0 + 30 * MIN, metar_type="SPECI")
-    inside = _next(c, calm_speci, T0 + 34 * MIN, history)
-    assert inside <= 15 * MIN  # 34 min after the storm report: still boosted
+    assert _next(c, calm_speci, T0 + 34 * MIN, history) <= 15 * MIN  # inside
 
-    calm = _report(T0 + 61 * MIN, receipt_time=T0 + 65 * MIN)
-    outside = _next(c, calm, T0 + 66 * MIN, history)
-    assert outside > 15 * MIN  # 66 min after: expired
+    calm = _report(T0 + 65 * MIN, receipt_time=T0 + 69 * MIN)
+    assert _next(c, calm, T0 + 70 * MIN, history) > 15 * MIN  # expired at +67
 
 
-def test_boost_afterglow_defaults_to_30_minutes_without_cadence(hass_with_domain):
-    assert _coordinator(hass_with_domain)._speci_afterglow() == 30 * MIN
+@pytest.mark.parametrize("history", [None, "half", "hourly"])
+def test_boost_afterglow_does_not_depend_on_cadence(hass_with_domain, history):
+    hist = {
+        None: None,
+        "half": _history(T0 - 60 * MIN, T0 - 30 * MIN, T0),
+        "hourly": _history(T0 - 120 * MIN, T0 - 60 * MIN, T0),
+    }[history]
+    c = _coordinator(hass_with_domain)
+    _next(c, _ts_report(T0, receipt_time=T0 + 4 * MIN), T0 + 7 * MIN, hist)
+    assert c._speci_boost_until == T0 + 67 * MIN
 
 
 def test_boost_not_kept_alive_by_old_held_report(hass_with_domain):
@@ -873,27 +878,35 @@ def test_station_id_with_weather_code_does_not_boost(hass_with_domain):
     assert _next(c, data, T0 + 7 * MIN, _half_hourly_history()) == 29 * MIN
 
 
-def test_boost_afterglow_is_clamped_to_30_and_60_minutes(hass_with_domain):
-    fast = _coordinator(hass_with_domain)
-    fast._learned_cadence = lambda: 10 * MIN
-    assert fast._speci_afterglow() == 30 * MIN  # lower bound
-    slow = _coordinator(hass_with_domain)
-    slow._learned_cadence = lambda: 180 * MIN
-    assert slow._speci_afterglow() == 60 * MIN  # upper bound
+def test_boost_afterglow_counts_from_the_fetch_not_the_observation(
+    hass_with_domain,
+):
+    """A SPECI observed at T0 but only seen at +25 min keeps the boost to
+    +85, not +60."""
+    c = _coordinator(hass_with_domain)
+    _next(c, _ts_report(T0, metar_type="SPECI"), T0 + 25 * MIN, _half_hourly_history())
+    assert c._speci_boost_until == T0 + 85 * MIN
 
 
 def test_boost_deadline_only_moves_forward(hass_with_domain):
-    """A later storm report extends the boost; an earlier one never
-    shortens it."""
+    """A newer storm report extends the boost; an older one never pulls it
+    back, and the same held report fetched again does not extend it."""
     c = _coordinator(hass_with_domain)
     history = _half_hourly_history()
-    _next(c, _ts_report(T0, receipt_time=T0 + 4 * MIN), T0 + 7 * MIN, history)
-    assert c._speci_boost_until == T0 + 30 * MIN
+    report = _ts_report(T0, receipt_time=T0 + 4 * MIN)
+    _next(c, report, T0 + 7 * MIN, history)
+    assert c._speci_boost_until == T0 + 67 * MIN
+
+    _next(c, report, T0 + 22 * MIN, history)  # same report again
+    assert c._speci_boost_until == T0 + 67 * MIN  # not extended
+
     later = T0 + 20 * MIN
-    _next(c, _ts_report(later, metar_type="SPECI"), later + 3 * MIN, history)
-    assert c._speci_boost_until == later + 30 * MIN
-    _next(c, _ts_report(T0, receipt_time=T0 + 4 * MIN), later + 5 * MIN, history)
-    assert c._speci_boost_until == later + 30 * MIN  # not pulled back
+    _next(c, _ts_report(later, metar_type="SPECI"), T0 + 37 * MIN, history)
+    assert c._speci_boost_until == T0 + 97 * MIN  # new report seen at +37
+
+    older = _ts_report(T0 - 10 * MIN, receipt_time=T0 - 6 * MIN)
+    _next(c, older, T0 + 40 * MIN, history)
+    assert c._speci_boost_until == T0 + 97 * MIN  # not pulled back
 
 
 def test_trend_group_after_tempo_is_not_current_weather():
